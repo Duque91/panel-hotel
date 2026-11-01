@@ -1,0 +1,174 @@
+name: Vigilante de la app
+
+# Vigilante gratuito de la app (este repositorio es público, así que no gasta
+# minutos). Cada 5 minutos:
+#  1. Recoge los avisos que deja la app al pulsar «Actualizar ahora» (o al
+#     cambiar de hotel) y los pasa a la consulta privada, que lee Booking y
+#     vuelve a publicar la app.
+#  2. Repasa el horario (09:00, 14:00, 18:00, 23:30 y el cierre de las 00:01,
+#     hora de Madrid): si a su hora GitHub no lanzó la consulta, la lanza él.
+# No guarda ni enseña ningún dato del hotel: el canal de avisos, la llave y el
+# repositorio privado están en los «secrets» de este repositorio.
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: vigilante
+  cancel-in-progress: false
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Avisos de la app y horario
+        env:
+          TEMA: ${{ secrets.TEMA_PEDIDOS }}
+          REPO: ${{ secrets.REPO_PEDIDOS }}
+          CLAVE: ${{ secrets.CLAVE_PEDIDOS }}
+          WEB: https://duque91.github.io/panel-hotel/version.json
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys, time, urllib.request
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          MAD = ZoneInfo("Europe/Madrid")
+          ahora = datetime.now(MAD)
+          TEMA, REPO = os.environ["TEMA"], os.environ["REPO"]
+          ACCIONES = ("precios", "buscar", "cambiar")
+          CAMPOS = ("texto", "destino", "cambio", "hotel_actual", "nombre", "ciudad")
+          TURNOS = ("09:00", "14:00", "18:00", "23:30")   # mismos que config.nube.yaml
+          ESPERA = timedelta(minutes=15)                  # margen para el horario de GitHub
+          SEPARACION = timedelta(minutes=8)               # entre dos pedidos seguidos
+          MAX_PEDIDOS = 24                                # en 12 h, por si alguien abusa del canal
+
+          def leer(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "vigilante-app", "Cache-Control": "no-cache"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return r.read().decode("utf-8")
+
+          def anotar(datos):
+              req = urllib.request.Request("https://ntfy.sh/" + TEMA, data=json.dumps(datos).encode(),
+                                           headers={"User-Agent": "vigilante-app"}, method="POST")
+              urllib.request.urlopen(req, timeout=20).read()
+
+          def hora(ts):
+              return datetime.fromtimestamp(ts, MAD)
+
+          def fecha(iso):
+              try:
+                  t = datetime.fromisoformat(iso or "")
+              except ValueError:
+                  return None
+              return t if t.tzinfo else t.replace(tzinfo=MAD)
+
+          # --- lo que hay en el canal (ntfy.sh guarda los mensajes 12 h) ---
+          mensajes = []
+          try:
+              for linea in leer(f"https://ntfy.sh/{TEMA}/json?poll=1&since=12h").splitlines():
+                  m = json.loads(linea)
+                  if m.get("event") != "message":
+                      continue
+                  try:
+                      m["datos"] = json.loads(m.get("message") or "")
+                  except ValueError:
+                      m["datos"] = {"accion": (m.get("message") or "").strip()}
+                  if isinstance(m["datos"], dict):
+                      mensajes.append(m)
+          except Exception as exc:
+              print("No se pudo leer el canal de avisos:", type(exc).__name__)
+              sys.exit(0)                                 # se vuelve a mirar en 5 minutos
+          mensajes.sort(key=lambda m: m.get("time", 0))
+          recogidos = {i for m in mensajes for i in (m["datos"].get("recogido") or [])}
+          lanzados = [m for m in mensajes if m["datos"].get("lanzado")]
+          ultimo = max((hora(m["time"]) for m in lanzados), default=None)
+          if ultimo and ahora - ultimo < SEPARACION:
+              print("Hay un pedido en marcha desde las", ultimo.strftime("%H:%M"), "; se espera.")
+              sys.exit(0)
+          if len(lanzados) >= MAX_PEDIDOS:
+              print("Demasiados pedidos en 12 horas; se espera.")
+              sys.exit(0)
+
+          pedido, recoger = None, []
+          pendientes = [m for m in mensajes if m["id"] not in recogidos
+                        and m["datos"].get("accion") in ACCIONES]
+          if pendientes:
+              p = pendientes[0]
+              recoger = [p["id"]]
+              if p["datos"]["accion"] == "precios":       # varios «Actualizar» seguidos = uno
+                  recoger += [m["id"] for m in pendientes[1:] if m["datos"]["accion"] == "precios"]
+              pedido = {"accion": p["datos"]["accion"]}
+              pedido.update({k: " ".join(str(p["datos"].get(k, "")).split())[:300] for k in CAMPOS})
+              print("Aviso de la app de las", hora(p["time"]).strftime("%H:%M"), "→", pedido["accion"])
+          else:
+              # --- repaso del horario ---
+              try:
+                  v = json.loads(leer(os.environ["WEB"] + "?t=" + str(time.time())))
+              except Exception as exc:
+                  print("No se pudo leer la app publicada:", type(exc).__name__)
+                  sys.exit(0)
+              turno = None
+              lectura = fecha(v.get("lectura"))
+              if lectura is not None:
+                  for t in reversed(TURNOS):
+                      h, mi = map(int, t.split(":"))
+                      desde = ahora.replace(hour=h, minute=mi, second=0, microsecond=0)
+                      if desde + ESPERA <= ahora:
+                          if lectura < desde and ahora - desde < timedelta(hours=4):
+                              turno = ahora.strftime("%Y-%m-%d ") + t
+                          break
+              if turno is None and ahora.hour < 2 and ahora.minute + 60 * ahora.hour >= 15 \
+                      and v.get("hoy") and v["hoy"] != ahora.strftime("%Y-%m-%d"):
+                  turno = "cierre " + ahora.strftime("%Y-%m-%d")
+              if turno is None:
+                  print("Todo al día", ahora.strftime("%H:%M"))
+                  sys.exit(0)
+              veces = [m for m in lanzados if m["datos"].get("turno") == turno]
+              if len(veces) >= 3 or (veces and ahora - hora(veces[-1]["time"]) < timedelta(minutes=40)):
+                  print("La consulta de", turno, "ya se pidió; se espera.")
+                  sys.exit(0)
+              pedido = {"accion": "programada", "turno": turno}
+              print("GitHub no lanzó la consulta de", turno, "; la lanza el vigilante.")
+
+          # --- se deja el pedido en el repositorio privado (eso lanza la consulta) ---
+          pedido["recibido"] = ahora.isoformat(timespec="seconds")
+          ssh = Path.home() / ".ssh"
+          ssh.mkdir(mode=0o700, exist_ok=True)
+          (ssh / "id_pedidos").write_text(os.environ["CLAVE"].strip() + "\n")
+          (ssh / "id_pedidos").chmod(0o600)
+          conocidos = subprocess.run(["ssh-keyscan", "-t", "ed25519,rsa", "github.com"],
+                                     capture_output=True, text=True).stdout
+          (ssh / "known_hosts").write_text(conocidos)
+          env = dict(os.environ, GIT_SSH_COMMAND=f"ssh -i {ssh / 'id_pedidos'} -o IdentitiesOnly=yes")
+
+          def git(*args, cwd="r"):
+              return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True)
+
+          r = git("clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout",
+                  f"git@github.com:{REPO}.git", "r", cwd=".")
+          if r.returncode:
+              print("No se pudo abrir el repositorio privado."); sys.exit(1)
+          git("sparse-checkout", "set", "--no-cone", "/datos/pedido.json")
+          git("checkout", "-q")
+          git("config", "user.name", "Duque91")
+          git("config", "user.email", "289804929+Duque91@users.noreply.github.com")
+          Path("r/datos").mkdir(exist_ok=True)
+          Path("r/datos/pedido.json").write_text(json.dumps(pedido, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+          git("add", "datos/pedido.json")
+          git("commit", "-q", "-m", f"Pedido desde la app: {pedido['accion']} ({ahora:%d/%m %H:%M})")
+          for intento in range(3):
+              if git("push", "-q", "origin", "HEAD:main").returncode == 0:
+                  break
+              git("pull", "-q", "--rebase", "origin", "main")
+          else:
+              print("No se pudo dejar el pedido; se reintenta en 5 minutos."); sys.exit(1)
+          anotar({"recogido": recoger, "lanzado": pedido["accion"], "turno": pedido.get("turno", ""),
+                  "at": pedido["recibido"]})
+          print("Pedido entregado: la consulta privada empieza ahora.")
+          PY
