@@ -1,23 +1,8 @@
-Copyright (c) 2026 Duque91 — titular de este programa y de los repositorios
-Duque91/booking-sync-hotel y Duque91/panel-hotel.
+Copyright (c) 2026 el titular de la cuenta de GitHub Duque91.
 
 TODOS LOS DERECHOS RESERVADOS.
 
-Este programa («booking-sync» y la app «Panel HR»: consulta diaria de los
-precios en Booking.com, histórico de precios, Excel y app privada con
-contraseña y huella) se ha hecho por encargo de su titular y para su uso.
-
-El titular se reserva todos los derechos de uso, copia, modificación,
-ampliación y distribución del programa, del diseño de la app, del logotipo
-y de los datos guardados (histórico de precios). Nadie puede copiar,
-distribuir, publicar ni usar este programa, ni parte de él, sin permiso
-escrito del titular.
-
-Componentes de terceros
------------------------
-El programa usa librerías de código abierto que conservan sus propias
-licencias (todas permiten su uso comercial): Playwright (Apache-2.0),
-Flask (BSD-3-Clause), PyYAML (MIT), openpyxl (MIT), cryptography
-(Apache-2.0 / BSD), webauthn (BSD-3-Clause), pywebpush (MPL-2.0) y tzdata
-(Apache-2.0). Los nombres de los hoteles, las marcas y los precios que se
-leen de Booking.com pertenecen a sus respectivos titulares.
+Esta app y su contenido (programa, diseño, logotipo y datos, que van
+cifrados) son de su titular. Nadie puede copiarlos, distribuirlos,
+publicarlos ni usarlos, ni en todo ni en parte, sin permiso escrito del
+titular.
