@@ -5,8 +5,11 @@ name: Vigilante de la app
 #  1. Recoge los avisos que deja la app al pulsar «Actualizar ahora» (o al
 #     cambiar de hotel) y los pasa a la consulta privada, que lee Booking y
 #     vuelve a publicar la app.
-#  2. Repasa el horario (09:00, 14:00, 18:00, 23:30 y el cierre de las 00:01,
-#     hora de Madrid): si a su hora GitHub no lanzó la consulta, la lanza él.
+#  2. Repasa el horario (08:45, 14:00, 18:00, 23:30 y el cierre de las 00:01,
+#     hora de Madrid) y lanza la consulta a su hora en punto: si la hora cae
+#     antes de la vuelta siguiente, espera dentro de esta vuelta hasta esa hora.
+#  3. Si el pedido trae la «suscripción» del móvil, la pasa también, para que
+#     la consulta privada avise al móvil al terminar.
 # No guarda ni enseña ningún dato del hotel: el canal de avisos, la llave y el
 # repositorio privado están en los «secrets» de este repositorio.
 #
@@ -34,7 +37,7 @@ jobs:
     environment: pausa          # espera de 4 minutos (Settings › Environments › pausa)
     permissions:
       actions: write            # solo para pedir la vuelta siguiente
-    timeout-minutes: 5
+    timeout-minutes: 10         # hasta 6 min de espera para lanzar a la hora en punto
     steps:
       - name: Avisos de la app y horario
         env:
@@ -54,8 +57,10 @@ jobs:
           TEMA, REPO = os.environ["TEMA"], os.environ["REPO"]
           ACCIONES = ("precios", "buscar", "cambiar")
           CAMPOS = ("texto", "destino", "cambio", "hotel_actual", "nombre", "ciudad")
-          TURNOS = ("09:00", "14:00", "18:00", "23:30")   # mismos que config.nube.yaml
-          ESPERA = timedelta(minutes=4)                   # margen para el horario de GitHub
+          TURNOS = ("08:45", "14:00", "18:00", "23:30")   # mismos que config.nube.yaml
+          CIERRE = (0, 1)                                 # 00:01: precio final del día anterior
+          ESPERA = timedelta(0)                           # se lanza a la hora en punto
+          ANTICIPO = 330                                  # s: si la hora llega antes de la vuelta siguiente, se espera aquí
           SEPARACION = timedelta(minutes=8)               # entre dos pedidos seguidos
           MAX_PEDIDOS = 24                                # en 12 h, por si alguien abusa del canal
 
@@ -71,6 +76,20 @@ jobs:
 
           def hora(ts):
               return datetime.fromtimestamp(ts, MAD)
+
+          def movil_de(d):
+              """La suscripción del móvil del pedido, validada y compacta ('' si no hay)."""
+              try:
+                  m = d.get("movil")
+                  m = json.loads(m) if isinstance(m, str) else m
+                  e, k = str(m["endpoint"]), m["keys"]
+                  if e.startswith("https://") and len(e) <= 1000 and k.get("p256dh") and k.get("auth"):
+                      t = json.dumps({"endpoint": e, "keys": {"p256dh": str(k["p256dh"])[:200], "auth": str(k["auth"])[:100]}},
+                                     separators=(",", ":"))
+                      return t if len(t) <= 2000 else ""
+              except Exception:
+                  pass
+              return ""
 
           def fecha(iso):
               try:
@@ -116,9 +135,22 @@ jobs:
                   recoger += [m["id"] for m in pendientes[1:] if m["datos"]["accion"] == "precios"]
               pedido = {"accion": p["datos"]["accion"]}
               pedido.update({k: " ".join(str(p["datos"].get(k, "")).split())[:300] for k in CAMPOS})
+              juntos = [m for m in pendientes if m["id"] in recoger]
+              movil = next((x for x in (movil_de(m["datos"]) for m in reversed(juntos)) if x), "")
+              if movil:
+                  pedido["movil"] = movil                 # para avisar al móvil al terminar
               print("Aviso de la app de las", hora(p["time"]).strftime("%H:%M"), "→", pedido["accion"])
           else:
               # --- repaso del horario ---
+              # ¿Toca una consulta antes de la vuelta siguiente? Se espera aquí hasta su hora en punto.
+              horas = [ahora.replace(hour=int(t[:2]), minute=int(t[3:]), second=0, microsecond=0) for t in TURNOS]
+              horas.append(ahora.replace(hour=CIERRE[0], minute=CIERRE[1], second=0, microsecond=0))
+              horas.append(horas[-1] + timedelta(days=1))
+              cerca = [h for h in horas if 0 < (h - ahora).total_seconds() <= ANTICIPO]
+              if cerca:
+                  print("Se espera hasta las", min(cerca).strftime("%H:%M"), "para lanzar la consulta en punto.")
+                  time.sleep((min(cerca) - ahora).total_seconds() + 2)
+                  ahora = datetime.now(MAD)
               try:
                   v = json.loads(leer(os.environ["WEB"] + "?t=" + str(time.time())))
               except Exception as exc:
@@ -134,7 +166,7 @@ jobs:
                           if lectura < desde and ahora - desde < timedelta(hours=4):
                               turno = ahora.strftime("%Y-%m-%d ") + t
                           break
-              if turno is None and ahora.hour < 2 and ahora.minute + 60 * ahora.hour >= 3 \
+              if turno is None and ahora.hour < 2 and ahora.minute + 60 * ahora.hour >= 60 * CIERRE[0] + CIERRE[1] \
                       and v.get("hoy") and v["hoy"] != ahora.strftime("%Y-%m-%d"):
                   turno = "cierre " + ahora.strftime("%Y-%m-%d")
               if turno is None:
