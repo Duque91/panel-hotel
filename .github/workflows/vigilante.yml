@@ -1,7 +1,7 @@
 name: Vigilante de la app
 
 # Vigilante gratuito de la app (este repositorio es público, así que no gasta
-# minutos). Cada 5 minutos:
+# minutos). Cada 5 minutos, más o menos:
 #  1. Recoge los avisos que deja la app al pulsar «Actualizar ahora» (o al
 #     cambiar de hotel) y los pasa a la consulta privada, que lee Booking y
 #     vuelve a publicar la app.
@@ -9,10 +9,18 @@ name: Vigilante de la app
 #     hora de Madrid): si a su hora GitHub no lanzó la consulta, la lanza él.
 # No guarda ni enseña ningún dato del hotel: el canal de avisos, la llave y el
 # repositorio privado están en los «secrets» de este repositorio.
+#
+# No depende del horario de GitHub (en esta cuenta no lanza las tareas
+# programadas): cada vuelta espera 4 minutos en el entorno «pausa» (una espera
+# que no ocupa ninguna máquina), mira, y al terminar pide la vuelta siguiente.
+# El «cron» queda solo de reserva para volver a arrancar la cadena si se parase.
 on:
   schedule:
     - cron: "2-59/5 * * * *"
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/vigilante.yml"]
 
 permissions: {}
 
@@ -23,6 +31,9 @@ concurrency:
 jobs:
   vigilar:
     runs-on: ubuntu-latest
+    environment: pausa          # espera de 4 minutos (Settings › Environments › pausa)
+    permissions:
+      actions: write            # solo para pedir la vuelta siguiente
     timeout-minutes: 5
     steps:
       - name: Avisos de la app y horario
@@ -44,7 +55,7 @@ jobs:
           ACCIONES = ("precios", "buscar", "cambiar")
           CAMPOS = ("texto", "destino", "cambio", "hotel_actual", "nombre", "ciudad")
           TURNOS = ("09:00", "14:00", "18:00", "23:30")   # mismos que config.nube.yaml
-          ESPERA = timedelta(minutes=15)                  # margen para el horario de GitHub
+          ESPERA = timedelta(minutes=4)                   # margen para el horario de GitHub
           SEPARACION = timedelta(minutes=8)               # entre dos pedidos seguidos
           MAX_PEDIDOS = 24                                # en 12 h, por si alguien abusa del canal
 
@@ -123,7 +134,7 @@ jobs:
                           if lectura < desde and ahora - desde < timedelta(hours=4):
                               turno = ahora.strftime("%Y-%m-%d ") + t
                           break
-              if turno is None and ahora.hour < 2 and ahora.minute + 60 * ahora.hour >= 15 \
+              if turno is None and ahora.hour < 2 and ahora.minute + 60 * ahora.hour >= 3 \
                       and v.get("hoy") and v["hoy"] != ahora.strftime("%Y-%m-%d"):
                   turno = "cierre " + ahora.strftime("%Y-%m-%d")
               if turno is None:
@@ -153,7 +164,7 @@ jobs:
           r = git("clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout",
                   f"git@github.com:{REPO}.git", "r", cwd=".")
           if r.returncode:
-              print("No se pudo abrir el repositorio privado."); sys.exit(1)
+              print("::warning::No se pudo abrir el repositorio privado; se reintenta en la vuelta siguiente."); sys.exit(0)
           git("sparse-checkout", "set", "--no-cone", "/datos/pedido.json")
           git("checkout", "-q")
           git("config", "user.name", "Duque91")
@@ -167,8 +178,28 @@ jobs:
                   break
               git("pull", "-q", "--rebase", "origin", "main")
           else:
-              print("No se pudo dejar el pedido; se reintenta en 5 minutos."); sys.exit(1)
+              print("::warning::No se pudo dejar el pedido; se reintenta en la vuelta siguiente."); sys.exit(0)
           anotar({"recogido": recoger, "lanzado": pedido["accion"], "turno": pedido.get("turno", ""),
                   "at": pedido["recibido"]})
           print("Pedido entregado: la consulta privada empieza ahora.")
           PY
+
+      - name: Vuelta siguiente
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Una sola cadena: si ya hay otra vuelta esperando o en marcha, no se pide otra.
+          otros=""
+          for i in 1 2 3; do
+            otros=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vigilante.yml/runs?per_page=20" \
+              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | select(.status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"requested\" or .status == \"in_progress\")] | length") && break
+            sleep 10
+          done
+          if [ -n "$otros" ] && [ "$otros" != "0" ]; then echo "Ya hay otra vuelta en marcha."; exit 0; fi
+          for i in 1 2 3; do
+            if gh workflow run vigilante.yml -R "$GITHUB_REPOSITORY" --ref main; then echo "Vuelta siguiente pedida."; exit 0; fi
+            sleep 15
+          done
+          echo "::error::No se pudo pedir la vuelta siguiente."
+          exit 1
