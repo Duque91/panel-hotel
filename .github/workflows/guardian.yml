@@ -1,0 +1,54 @@
+name: Guardián del vigilante
+
+# Segundo seguro, también gratis (repositorio público): cada 30 minutos (espera
+# en el entorno «pausa-larga», que no ocupa ninguna máquina) comprueba que el
+# vigilante de la app sigue dando vueltas y, si se hubiera parado, lo vuelve a
+# arrancar. El vigilante, a su vez, arranca al guardián si se parase él.
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/guardian.yml"]
+
+permissions: {}
+
+concurrency:
+  group: guardian
+  cancel-in-progress: false
+
+jobs:
+  guardar:
+    runs-on: ubuntu-latest
+    environment: pausa-larga
+    permissions:
+      actions: write
+    timeout-minutes: 3
+    steps:
+      - name: Vigilante y vuelta siguiente
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ¿Hay alguna vuelta del flujo $1 esperando o en marcha (sin contar esta)?
+          activas() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$1/runs?per_page=20" \
+              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | select(.status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"requested\" or .status == \"in_progress\")] | length"
+          }
+          arrancar() {
+            for i in 1 2 3; do
+              n=$(activas "$1") && break
+              sleep 10
+            done
+            if [ -n "$n" ] && [ "$n" != "0" ]; then echo "$1: en marcha."; return 0; fi
+            for i in 1 2 3; do
+              if gh workflow run "$1" -R "$GITHUB_REPOSITORY" --ref main; then echo "$1: arrancado."; return 0; fi
+              sleep 15
+            done
+            echo "::error::No se pudo arrancar $1."; return 1
+          }
+          ok=0
+          arrancar vigilante.yml || ok=1
+          arrancar guardian.yml || ok=1
+          exit $ok

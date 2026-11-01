@@ -189,17 +189,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # ¿Hay alguna vuelta del flujo $1 esperando o en marcha (sin contar esta)?
+          activas() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$1/runs?per_page=20" \
+              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | select(.status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"requested\" or .status == \"in_progress\")] | length"
+          }
           # Una sola cadena: si ya hay otra vuelta esperando o en marcha, no se pide otra.
-          otros=""
-          for i in 1 2 3; do
-            otros=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vigilante.yml/runs?per_page=20" \
-              --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID) | select(.status == \"queued\" or .status == \"waiting\" or .status == \"pending\" or .status == \"requested\" or .status == \"in_progress\")] | length") && break
-            sleep 10
-          done
-          if [ -n "$otros" ] && [ "$otros" != "0" ]; then echo "Ya hay otra vuelta en marcha."; exit 0; fi
-          for i in 1 2 3; do
-            if gh workflow run vigilante.yml -R "$GITHUB_REPOSITORY" --ref main; then echo "Vuelta siguiente pedida."; exit 0; fi
-            sleep 15
-          done
-          echo "::error::No se pudo pedir la vuelta siguiente."
-          exit 1
+          arrancar() {
+            for i in 1 2 3; do
+              n=$(activas "$1") && break
+              sleep 10
+            done
+            if [ -n "$n" ] && [ "$n" != "0" ]; then echo "$1: en marcha."; return 0; fi
+            for i in 1 2 3; do
+              if gh workflow run "$1" -R "$GITHUB_REPOSITORY" --ref main; then echo "$1: vuelta pedida."; return 0; fi
+              sleep 15
+            done
+            echo "::error::No se pudo pedir la vuelta de $1."; return 1
+          }
+          ok=0
+          arrancar vigilante.yml || ok=1
+          arrancar guardian.yml || true      # el guardián vuelve a arrancar al vigilante si se parase
+          exit $ok
